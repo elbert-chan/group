@@ -20,6 +20,9 @@ type G struct {
 
 	errOnce sync.Once
 	err     error
+
+	// sem is a semaphore for limiting concurrent goroutines
+	sem chan struct{}
 }
 
 type Option func(*G)
@@ -28,6 +31,16 @@ type Option func(*G)
 func WithContext(ctx context.Context) Option {
 	return func(g *G) {
 		g.ctx = ctx
+	}
+}
+
+// WithMaxConcurrency sets the maximum number of concurrent goroutines.
+// If n <= 0, no limit is applied.
+func WithMaxConcurrency(n int) Option {
+	return func(g *G) {
+		if n > 0 {
+			g.sem = make(chan struct{}, n)
+		}
 	}
 }
 
@@ -46,13 +59,23 @@ func (g *G) init() {
 		g.ctx = context.Background()
 	}
 	g.ctx, g.cancel = context.WithCancel(g.ctx)
+
+	// If semaphore is not set, create one with large capacity (no practical limit)
+	if g.sem == nil {
+		g.sem = make(chan struct{}, 1000000)
+	}
 }
 
-// add adds a new goroutine to the group. The goroutine should exit when the context
+// Add adds a new goroutine to the group. The goroutine should exit when the context
 // passed to it is canceled.
 func (g *G) Add(fn func(context.Context) error) {
 	g.initOnce.Do(g.init)
+
+	// Acquire semaphore slot, blocking if limit is reached
+	g.sem <- struct{}{}
+
 	g.done.Go(func() {
+		defer func() { <-g.sem }()
 		defer g.cancel()
 		defer func() {
 			if r := recover(); r != nil {
@@ -71,8 +94,6 @@ func (g *G) Add(fn func(context.Context) error) {
 	})
 }
 
-// wait waits for all goroutines in the group to exit. If any of the goroutines
-// fail with an error, wait will return the first error.
 // Wait waits for all goroutines in the group to exit.
 // If any of the goroutines fail with an error, Wait will return the first error.
 func (g *G) Wait() error {
